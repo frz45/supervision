@@ -8,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+const CHECK_INTERVAL_MS = 2 * 60 * 1000;
 const MAX_HISTORY = 100;
 
 const store = {
@@ -64,9 +64,7 @@ function checkSite(site) {
           socket.on('secureConnect', () => {
             try {
               const cert = socket.getPeerCertificate();
-              if (cert && cert.valid_to) {
-                sslExpiry = new Date(cert.valid_to).toISOString();
-              }
+              if (cert && cert.valid_to) sslExpiry = new Date(cert.valid_to).toISOString();
             } catch (_) {}
           });
         });
@@ -99,9 +97,7 @@ async function checkAllSites() {
       const result = await checkSite(site);
       if (!store.history[site.id]) store.history[site.id] = [];
       store.history[site.id].unshift(result);
-      if (store.history[site.id].length > MAX_HISTORY) {
-        store.history[site.id].length = MAX_HISTORY;
-      }
+      if (store.history[site.id].length > MAX_HISTORY) store.history[site.id].length = MAX_HISTORY;
       return { siteId: site.id, ...result };
     })
   );
@@ -117,15 +113,45 @@ function buildSiteResponse(site) {
   const upCount = recent.filter(h => !h.error).length;
   const uptime = recent.length > 0 ? Math.round((upCount / recent.length) * 100) : null;
 
-  const validTimes = recent.filter(h => h.responseTime != null).map(h => h.responseTime);
-  const avgResponseTime = validTimes.length > 0
-    ? Math.round(validTimes.reduce((a, b) => a + b, 0) / validTimes.length)
-    : null;
+  const times = recent.filter(h => h.responseTime != null).map(h => h.responseTime);
+  const avgResponseTime = times.length > 0 ? Math.round(times.reduce((a, b) => a + b, 0) / times.length) : null;
+  const minResponseTime = times.length > 0 ? Math.min(...times) : null;
+  const maxResponseTime = times.length > 0 ? Math.max(...times) : null;
 
-  return { ...site, latest, recentHistory: recent, uptime, avgResponseTime, checksCount: history.length };
+  // Last incident in full history
+  const lastIncident = history.find(h => h.error != null) || null;
+
+  // Incidents in recent 20 checks
+  const recentIncidents = recent.filter(h => h.error != null).length;
+
+  // Response time trend: recent 10 vs older 10
+  let trend = null;
+  if (recent.length >= 10) {
+    const newHalf = recent.slice(0, 10).filter(h => h.responseTime != null).map(h => h.responseTime);
+    const oldHalf = recent.slice(10, 20).filter(h => h.responseTime != null).map(h => h.responseTime);
+    if (newHalf.length >= 3 && oldHalf.length >= 3) {
+      const newAvg = newHalf.reduce((a, b) => a + b, 0) / newHalf.length;
+      const oldAvg = oldHalf.reduce((a, b) => a + b, 0) / oldHalf.length;
+      const pct = ((newAvg - oldAvg) / oldAvg) * 100;
+      trend = pct > 10 ? 'degrading' : pct < -10 ? 'improving' : 'stable';
+    }
+  }
+
+  return {
+    ...site,
+    latest,
+    recentHistory: recent,
+    uptime,
+    avgResponseTime,
+    minResponseTime,
+    maxResponseTime,
+    lastIncident,
+    recentIncidents,
+    trend,
+    checksCount: history.length
+  };
 }
 
-// Routes
 app.get('/api/sites', (_req, res) => {
   res.json(store.sites.map(buildSiteResponse));
 });
@@ -138,11 +164,8 @@ app.post('/api/sites', async (req, res) => {
   if (!normalized.startsWith('http')) normalized = 'https://' + normalized;
 
   let hostname;
-  try {
-    hostname = new URL(normalized).hostname;
-  } catch {
-    return res.status(400).json({ error: 'URL invalide' });
-  }
+  try { hostname = new URL(normalized).hostname; }
+  catch { return res.status(400).json({ error: 'URL invalide' }); }
 
   const site = {
     id: generateId(),
@@ -152,7 +175,6 @@ app.post('/api/sites', async (req, res) => {
   };
 
   store.sites.push(site);
-
   const result = await checkSite(site);
   store.history[site.id] = [result];
 
@@ -178,7 +200,7 @@ app.post('/api/check', async (_req, res) => {
   res.json(results);
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, sites: store.sites.length }));
+app.get('/health', (_req, res) => res.json({ ok: true, sites: store.sites.length, uptime: process.uptime() }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
